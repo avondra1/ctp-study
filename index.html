@@ -466,6 +466,29 @@ const DOMAIN_TITLE = DATA.domains;
 
 // slow threshold for a "got it" that took too long (seconds). Exam pace ≈ 74s/Q.
 const SLOW_GOT_SEC = 20;
+
+// ---------- spaced repetition ----------
+// Expanding interval ladder (days). Index advances on correct, resets on wrong.
+const SRS_INTERVALS = [1, 3, 7, 16, 35, 70];
+const LEECH_WRONG = 5; // total wrongs that flag an item as a "leech"
+const dayMs = 86400000;
+const addDays = (d, n) => new Date(d.getTime() + n * dayMs);
+const dateOnly = d => new Date(d.toISOString().slice(0, 10) + "T00:00:00");
+// next due ISO date given correctness + current srs level
+function nextDue(correct, level) {
+  const idx = correct ? Math.min(level, SRS_INTERVALS.length - 1) : 0;
+  const days = correct ? SRS_INTERVALS[idx] : 1; // wrong → review tomorrow
+  return dateOnly(addDays(new Date(), days)).toISOString().slice(0, 10);
+}
+// is an item due for REVIEW (must have been seen before; new items aren't "due")
+function isDue(p) {
+  if (!p || !(p.seen > 0)) return false; // never seen → not a review, belongs to "new"
+  if (!p.due) return true; // seen but unscheduled → review now
+  return p.due <= todayStr();
+}
+function isLeech(p) {
+  return !!p && (p.wrong || 0) >= LEECH_WRONG;
+}
 // =================== MAIN APP ===================
 function App() {
   const [tab, setTab] = useState("study");
@@ -475,7 +498,8 @@ function App() {
     streak: {
       best: 0,
       current: 0
-    }
+    },
+    daily: {}
   });
   const [loaded, setLoaded] = useState(false);
   const [sync, setSync] = useState({
@@ -494,7 +518,8 @@ function App() {
       streak: {
         best: 0,
         current: 0
-      }
+      },
+      daily: {}
     };
     setState(local);
     setLoaded(true);
@@ -571,7 +596,7 @@ function App() {
   const persist = useCallback(next => persistFn(next), [persistFn]);
 
   // record one item interaction (with time in seconds)
-  const record = useCallback((id, correct, conf, secs) => {
+  const record = useCallback((id, correct, conf, secs, wrongPickId) => {
     persistFn(prev => {
       const cur = prev.progress[id] || {
         seen: 0,
@@ -580,9 +605,19 @@ function App() {
         lastConf: null,
         lastSeen: null,
         totalSec: 0,
-        slowGot: 0
+        slowGot: 0,
+        streak: 0,
+        lastSecs: null,
+        srs: 0,
+        due: null,
+        confused: {}
       };
       const slow = conf === "got" && secs != null && secs > SLOW_GOT_SEC ? 1 : 0;
+      const srsLevel = correct ? (cur.srs || 0) + 1 : 0; // advance/reset ladder
+      const confused = {
+        ...(cur.confused || {})
+      };
+      if (!correct && wrongPickId) confused[wrongPickId] = (confused[wrongPickId] || 0) + 1;
       const nextItem = {
         seen: cur.seen + 1,
         right: cur.right + (correct ? 1 : 0),
@@ -590,17 +625,32 @@ function App() {
         lastConf: conf ?? cur.lastConf,
         lastSeen: todayStr(),
         totalSec: (cur.totalSec || 0) + (secs || 0),
-        slowGot: (cur.slowGot || 0) + slow
+        slowGot: (cur.slowGot || 0) + slow,
+        streak: correct ? (cur.streak || 0) + 1 : 0,
+        lastSecs: secs != null ? +secs.toFixed(1) : cur.lastSecs,
+        srs: srsLevel,
+        due: nextDue(correct, srsLevel),
+        confused
       };
+      // daily activity counter
+      const daily = {
+        ...(prev.daily || {})
+      };
+      daily[todayStr()] = (daily[todayStr()] || 0) + 1;
       return {
         ...prev,
         progress: {
           ...prev.progress,
           [id]: nextItem
-        }
+        },
+        daily
       };
     });
   }, [persistFn]);
+
+  // mastery: last 2+ in a row correct
+  // (defined here for reference; filter logic lives in buildQueue)
+
   const saveSessions = useCallback(sessions => persistFn(prev => ({
     ...prev,
     sessions
@@ -697,10 +747,15 @@ function mergeState(a, b) {
   }
   sessions.sort((x, y) => new Date(y.date) - new Date(x.date));
   const streak = (a.streak?.best || 0) >= (b.streak?.best || 0) ? a.streak : b.streak;
+  const daily = {
+    ...(a.daily || {})
+  };
+  for (const [d, n] of Object.entries(b.daily || {})) daily[d] = Math.max(daily[d] || 0, n);
   return {
     progress,
     sessions: sessions.slice(0, 200),
-    streak
+    streak,
+    daily
   };
 }
 function Splash() {
@@ -1036,6 +1091,11 @@ function errorWeight(p) {
   if (p.lastConf === "blank") w += 4;else if (p.lastConf === "shaky") w += 2;else if (p.lastConf === "got") w *= 0.4; // confident → fade
   return w;
 }
+
+// mastered = last 2+ answers correct in a row
+function isMastered(p) {
+  return !!p && (p.streak || 0) >= 2;
+}
 function buildQueue(progress, opts) {
   const {
     domainFilter,
@@ -1043,7 +1103,9 @@ function buildQueue(progress, opts) {
     typeFilter,
     hyOnly,
     n,
-    flat
+    flat,
+    mastery,
+    dueOnly
   } = opts;
   let pool = DATA.items.filter(i => i.t !== "a" || typeFilter === "acronym"); // acronyms only if explicitly chosen
   if (typeFilter === "definition") pool = pool.filter(i => i.t === "d");
@@ -1053,9 +1115,9 @@ function buildQueue(progress, opts) {
   if (hyOnly) pool = pool.filter(i => i.hy);
   if (domainFilter !== "all") pool = pool.filter(i => String(i.d) === domainFilter);
   if (chapterFilter && chapterFilter !== "all") pool = pool.filter(i => String(i.ch) === chapterFilter);
-
-  // Domain weighting applies only in "weighted" scope. When flat, or locked to a
-  // single domain/chapter, weighting is neutral; error weight still drives resurfacing.
+  if (dueOnly) pool = pool.filter(i => isDue(progress[i.id]));
+  // mastery filter
+  if (mastery === "unmastered") pool = pool.filter(i => !isMastered(progress[i.id]));else if (mastery === "mastered") pool = pool.filter(i => isMastered(progress[i.id]));
   const locked = flat || domainFilter !== "all" || chapterFilter && chapterFilter !== "all";
   const scored = pool.map(i => {
     const dw = locked ? 10 : DOMAIN_WEIGHT[i.d] || 10;
@@ -1065,13 +1127,46 @@ function buildQueue(progress, opts) {
     };
   });
   scored.sort((a, b) => b.w - a.w);
-  return scored.slice(0, n).map(s => s.item);
+  const limit = n === "all" || n == null ? scored.length : n;
+  return scored.slice(0, limit).map(s => s.item);
 }
-function makeMCQ(item, allOfDomain) {
-  // term -> definition (productive direction): show TERM, pick correct DEFINITION
-  const sameDomain = allOfDomain.filter(i => i.id !== item.id && i.t === item.t);
-  const distract = shuffle(sameDomain).slice(0, 3);
-  const options = shuffle([item, ...distract]);
+
+// count items available for a scope (mirrors buildQueue filters, no sampling)
+function countAvailable(progress, opts) {
+  const {
+    domainFilter,
+    chapterFilter,
+    typeFilter,
+    hyOnly,
+    mastery,
+    dueOnly
+  } = opts;
+  let p = DATA.items.filter(i => i.t !== "a" || typeFilter === "acronym");
+  if (typeFilter === "definition") p = p.filter(i => i.t === "d");else if (typeFilter === "formula") p = p.filter(i => i.t === "f");else if (typeFilter === "acronym") p = p.filter(i => i.t === "a");else if (typeFilter === "all") p = p.filter(i => i.t === "d" || i.t === "f");
+  if (hyOnly) p = p.filter(i => i.hy);
+  if (domainFilter !== "all") p = p.filter(i => String(i.d) === domainFilter);
+  if (chapterFilter && chapterFilter !== "all") p = p.filter(i => String(i.ch) === chapterFilter);
+  if (dueOnly) p = p.filter(i => isDue(progress[i.id]));
+  if (mastery === "unmastered") p = p.filter(i => !isMastered(progress[i.id]));else if (mastery === "mastered") p = p.filter(i => isMastered(progress[i.id]));
+  return p.length;
+}
+function makeMCQ(item, candidatePool) {
+  // Harder distractors: prefer same chapter, then same domain, same type.
+  const sameType = candidatePool.filter(i => i.id !== item.id && i.t === item.t);
+  const sameChapter = sameType.filter(i => i.ch && i.ch === item.ch);
+  const sameDomain = sameType.filter(i => i.d && i.d === item.d);
+  let picks = shuffle(sameChapter).slice(0, 3);
+  if (picks.length < 3) {
+    const need = 3 - picks.length;
+    const used = new Set(picks.map(p => p.id));
+    picks = picks.concat(shuffle(sameDomain.filter(i => !used.has(i.id))).slice(0, need));
+  }
+  if (picks.length < 3) {
+    const need = 3 - picks.length;
+    const used = new Set([item.id, ...picks.map(p => p.id)]);
+    picks = picks.concat(shuffle(sameType.filter(i => !used.has(i.id))).slice(0, need));
+  }
+  const options = shuffle([item, ...picks]);
   return {
     options,
     answer: item.id
@@ -1135,9 +1230,9 @@ function QuizMode({
     };
     saveSessions([sess, ...sessions].slice(0, 200));
   }, [results, score, sessions, saveSessions]);
-  const onAnswer = (correct, conf, item) => {
+  const onAnswer = (correct, conf, item, wrongPickId) => {
     const secs = Math.max(0, (Date.now() - qStartRef.current) / 1000);
-    record(item.id, correct, conf, secs);
+    record(item.id, correct, conf, secs, wrongPickId);
     setScore(s => s + (correct ? 1 : 0));
     setResults(r => [...r, {
       correct,
@@ -1196,7 +1291,6 @@ function QuizMode({
   }), /*#__PURE__*/React.createElement(QuizCard, {
     key: item.id + idx,
     item: item,
-    mode: config.mode,
     onAnswer: onAnswer,
     onNext: next,
     progress: progress
@@ -1210,21 +1304,34 @@ function QuizSetup({
   const [domain, setDomain] = useState("1");
   const [chapter, setChapter] = useState("10");
   const [type, setType] = useState("all");
-  const [mode, setMode] = useState("mcq");
+  const [mastery, setMastery] = useState("all"); // all | unmastered | mastered
   const [hyOnly, setHyOnly] = useState(false);
-  const [n, setN] = useState(20);
+  const [n, setN] = useState("20"); // string; "all" = no cap
+
   const chapters = useMemo(() => [...new Set(DATA.items.filter(i => i.ch).map(i => i.ch))].sort((a, b) => a - b), []);
   const domainFilter = scope === "domain" ? domain : "all";
   const chapterFilter = scope === "chapter" ? chapter : "all";
-  const available = useMemo(() => {
-    let p = DATA.items.filter(i => i.t !== "a");
-    if (type === "definition") p = p.filter(i => i.t === "d");else if (type === "formula") p = p.filter(i => i.t === "f");else if (type === "acronym") p = DATA.items.filter(i => i.t === "a");else p = p.filter(i => i.t === "d" || i.t === "f");
-    if (hyOnly) p = p.filter(i => i.hy);
-    if (domainFilter !== "all") p = p.filter(i => String(i.d) === domainFilter);
-    if (chapterFilter !== "all") p = p.filter(i => String(i.ch) === chapterFilter);
-    return p.length;
-  }, [scope, domain, chapter, type, hyOnly, domainFilter, chapterFilter]);
+  const dueOnly = scope === "due";
+
+  // global count of due items (defs+formulas) — drives the Due button glow
+  const dueCount = useMemo(() => countAvailable(progress, {
+    domainFilter: "all",
+    chapterFilter: "all",
+    typeFilter: "all",
+    hyOnly: false,
+    dueOnly: true
+  }), [progress]);
+  const available = useMemo(() => countAvailable(progress, {
+    domainFilter,
+    chapterFilter,
+    typeFilter: type,
+    hyOnly,
+    mastery,
+    dueOnly
+  }), [progress, domainFilter, chapterFilter, type, hyOnly, mastery, dueOnly]);
   const chapDomain = DATA.chapter_domain[chapter]?.domain;
+  const wantN = n === "all" ? available : Number(n);
+  const sessionN = Math.min(wantN, available);
   return /*#__PURE__*/React.createElement("div", {
     style: {
       paddingTop: 18
@@ -1237,11 +1344,25 @@ function QuizSetup({
     className: "setup"
   }, /*#__PURE__*/React.createElement(Field, {
     label: "SCOPE"
-  }, /*#__PURE__*/React.createElement(Seg, {
-    value: scope,
-    set: setScope,
-    opts: [["weighted", "Whole exam (weighted)"], ["all", "All available (flat)"], ["domain", "By domain"], ["chapter", "By chapter"]]
-  }), scope === "weighted" && /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "seg",
+    style: {
+      flexWrap: "wrap"
+    }
+  }, [["weighted", "Whole exam (weighted)"], ["all", "All available (flat)"], ["domain", "By domain"], ["chapter", "By chapter"], ["due", dueCount > 0 ? `Due (${dueCount})` : "Due"]].map(([v, l]) => {
+    const active = scope === v;
+    const glow = v === "due" && dueCount > 0;
+    return /*#__PURE__*/React.createElement("button", {
+      key: v,
+      onClick: () => setScope(v),
+      className: "segbtn" + (glow ? " segglow" : ""),
+      style: {
+        background: active ? C.amber : glow ? C.amber + "22" : "transparent",
+        color: active ? "#000" : glow ? C.amber : C.dim,
+        fontWeight: active || glow ? 700 : 500
+      }
+    }, l);
+  })), scope === "weighted" && /*#__PURE__*/React.createElement("div", {
     className: "hint"
   }, "Mirrors official scored-question counts: D1≈58, D2≈36, D4≈26, D5≈16, D3≈15. Domain 1 dominates, as on the exam."), scope === "all" && /*#__PURE__*/React.createElement("div", {
     className: "hint"
@@ -1249,7 +1370,9 @@ function QuizSetup({
     className: "hint"
   }, "Locks the session to one domain. Weights are official; which items belong to a domain is Claude's chapter→domain inference."), scope === "chapter" && /*#__PURE__*/React.createElement("div", {
     className: "hint"
-  }, "Locks the session to a single ETM8 chapter — the tightest drill.")), scope === "domain" && /*#__PURE__*/React.createElement(Field, {
+  }, "Locks the session to a single ETM8 chapter — the tightest drill."), scope === "due" && /*#__PURE__*/React.createElement("div", {
+    className: "hint"
+  }, "Spaced repetition: drills items you've already seen that are scheduled for review today (", dueCount, " due). New items aren't counted here — reach those through the other scopes. Mastered items return on expanding intervals (1→3→7→16→35 days); missed items come back tomorrow.")), scope === "domain" && /*#__PURE__*/React.createElement(Field, {
     label: "DOMAIN"
   }, /*#__PURE__*/React.createElement(Seg, {
     value: domain,
@@ -1291,15 +1414,17 @@ function QuizSetup({
     value: type,
     set: setType,
     opts: [["all", "Defs + Formulas"], ["definition", "Definitions"], ["formula", "Formulas"], ["acronym", "Acronyms"]]
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "RECALL MODE"
-  }, /*#__PURE__*/React.createElement(Seg, {
-    value: mode,
-    set: setMode,
-    opts: [["mcq", "Multiple choice"], ["blank", "Fill-in-the-blank"], ["mix", "Mixed"]]
   }), /*#__PURE__*/React.createElement("div", {
     className: "hint"
-  }, "Definitions test term → meaning (productive recall). Formulas always use blank-a-term + whole-formula recall.")), /*#__PURE__*/React.createElement(Field, {
+  }, "All multiple choice. Definitions show the ", /*#__PURE__*/React.createElement("b", null, "definition"), " and you pick the ", /*#__PURE__*/React.createElement("b", null, "term"), ", with close same-chapter distractors. Formulas use blank-a-term + whole-formula recall.")), /*#__PURE__*/React.createElement(Field, {
+    label: "MASTERY"
+  }, /*#__PURE__*/React.createElement(Seg, {
+    value: mastery,
+    set: setMastery,
+    opts: [["all", "All"], ["unmastered", "Unmastered only"], ["mastered", "Mastered only"]]
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "hint"
+  }, "“Mastered” = answered correctly the last 2+ times in a row. Drill ", /*#__PURE__*/React.createElement("b", null, "unmastered"), " to focus on what hasn’t stuck.")), /*#__PURE__*/React.createElement(Field, {
     label: "OPTIONS"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => setHyOnly(v => !v),
@@ -1314,16 +1439,16 @@ function QuizSetup({
     },
     className: "flbl"
   }, "LENGTH"), /*#__PURE__*/React.createElement(Seg, {
-    value: String(n),
-    set: v => setN(Number(v)),
-    opts: [["10", "10"], ["20", "20"], ["40", "40"], ["60", "60"]]
+    value: n,
+    set: setN,
+    opts: [["10", "10"], ["20", "20"], ["40", "40"], ["60", "60"], ["all", "All"]]
   })), /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: MONO,
       fontSize: 11,
       color: available === 0 ? C.blank : C.faint
     }
-  }, available, " item", available === 1 ? "" : "s", " in scope", available > 0 && available < n ? ` — session will be ${available} (fewer than ${n} available)` : ""), /*#__PURE__*/React.createElement("button", {
+  }, available, " item", available === 1 ? "" : "s", " in scope", available > 0 && (n === "all" ? ` — session will run all ${available}` : sessionN < wantN ? ` — session will be ${sessionN} (fewer than ${wantN} available)` : ` — session of ${sessionN}`)), /*#__PURE__*/React.createElement("button", {
     className: "primary",
     disabled: available === 0,
     style: {
@@ -1334,10 +1459,11 @@ function QuizSetup({
       domainFilter,
       chapterFilter,
       typeFilter: type,
-      mode,
       hyOnly,
+      mastery,
+      dueOnly,
       flat: scope === "all",
-      n: Math.min(n, available)
+      n: n === "all" ? "all" : sessionN
     })
   }, available === 0 ? "NO ITEMS IN SCOPE" : "BEGIN SESSION →")));
 }
@@ -1398,19 +1524,11 @@ function QuizHUD({
 // =================== QUIZ CARD ===================
 function QuizCard({
   item,
-  mode,
   onAnswer,
   onNext,
   progress
 }) {
-  const isFormula = item.t === "f";
-  const effMode = isFormula ? "formula" : mode === "mix" ? pick(["mcq", "blank"]) : mode;
-  if (effMode === "formula") return /*#__PURE__*/React.createElement(FormulaCard, {
-    item: item,
-    onAnswer: onAnswer,
-    onNext: onNext
-  });
-  if (effMode === "blank") return /*#__PURE__*/React.createElement(BlankCard, {
+  if (item.t === "f") return /*#__PURE__*/React.createElement(FormulaCard, {
     item: item,
     onAnswer: onAnswer,
     onNext: onNext
@@ -1529,38 +1647,58 @@ function ConfPick({
   }));
 }
 
-// ---- Multiple choice: term -> definition, same-domain distractors ----
+// ---- Multiple choice. Definitions/acronyms show the MEANING; you pick the TERM.
+//      Distractors are close (same chapter/domain). Per-item timer shown live. ----
 function MCQCard({
   item,
   onAnswer,
   onNext
 }) {
-  const pool = useMemo(() => DATA.items.filter(i => i.t === item.t && i.d === item.d), [item]);
+  const pool = useMemo(() => DATA.items.filter(i => i.t === item.t), [item]);
   const {
     options,
     answer
-  } = useMemo(() => makeMCQ(item, pool.length >= 4 ? pool : DATA.items.filter(i => i.t === item.t)), [item, pool]);
-  const [selected, setSelected] = useState(null); // pending answer pick
-  const [conf, setConf] = useState(null); // pending confidence pick
+  } = useMemo(() => makeMCQ(item, pool), [item, pool]);
+  const [selected, setSelected] = useState(null);
+  const [conf, setConf] = useState(null);
   const [submitted, setSubmitted] = useState(false);
+  const [now, setNow] = useState(Date.now());
+  const startRef = useRef(Date.now());
   const correct = selected === answer;
   const ready = selected && conf;
+
+  // live per-item timer until submitted
+  useEffect(() => {
+    if (submitted) return;
+    const t = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(t);
+  }, [submitted]);
+  const elapsedSec = (now - startRef.current) / 1000;
   const select = id => {
     if (!submitted) setSelected(id);
   };
   const submit = () => {
     if (!ready || submitted) return;
     setSubmitted(true);
-    onAnswer(correct, conf, item); // commit answer + confidence together
+    onAnswer(correct, conf, item, correct ? null : selected);
   };
+
+  // prompt = the MEANING; options = the TERMS
+  const promptText = item.t === "a" ? item.body : item.body;
+  const label = item.t === "a" ? "NAME THE ACRONYM" : "NAME THE TERM";
   return /*#__PURE__*/React.createElement("div", {
     className: "card"
   }, /*#__PURE__*/React.createElement(Stem, {
     item: item,
-    label: "DEFINE THE TERM"
+    label: label
   }), /*#__PURE__*/React.createElement("div", {
-    className: "prompt"
-  }, item.term), /*#__PURE__*/React.createElement("div", {
+    className: "prompt",
+    style: {
+      fontSize: 17,
+      fontWeight: 500,
+      lineHeight: 1.5
+    }
+  }, promptText), /*#__PURE__*/React.createElement("div", {
     className: "opts"
   }, options.map(o => {
     let cls = "opt";
@@ -1579,18 +1717,28 @@ function MCQCard({
       "aria-hidden": true
     }, submitted && o.id === answer ? "✓" : submitted && o.id === selected ? "✕" : o.id === selected ? "●" : "○"), /*#__PURE__*/React.createElement("span", {
       style: {
-        flex: 1
+        flex: 1,
+        fontWeight: 600
       }
-    }, o.t === "f" ? /*#__PURE__*/React.createElement("span", {
-      style: {
-        fontFamily: MONO
-      }
-    }, eqDisplay(o.eq)) : o.body));
-  })), !submitted ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(ConfPick, {
+    }, o.term));
+  })), !submitted ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginTop: 14
+    }
+  }, /*#__PURE__*/React.createElement(ConfPick, {
     value: conf,
     onPick: setConf,
     prompt: "BEFORE YOU SUBMIT — HOW CONFIDENT?"
-  }), /*#__PURE__*/React.createElement("button", {
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: MONO,
+      fontSize: 12,
+      color: elapsedSec > SLOW_GOT_SEC ? C.shaky : C.faint
+    }
+  }, elapsedSec.toFixed(1), "s")), /*#__PURE__*/React.createElement("button", {
     className: "primary",
     onClick: submit,
     disabled: !ready,
@@ -1603,12 +1751,12 @@ function MCQCard({
     style: {
       color: correct ? C.good : C.blank
     }
-  }, correct ? "✓ Correct" : "✗ Incorrect — correct answer highlighted", /*#__PURE__*/React.createElement("span", {
+  }, correct ? "✓ Correct" : `✗ Incorrect — answer: ${item.term}`, /*#__PURE__*/React.createElement("span", {
     style: {
       color: C.faint,
       marginLeft: 10
     }
-  }, "· you rated: ", conf === "got" ? "got it" : conf)), /*#__PURE__*/React.createElement("button", {
+  }, "· ", elapsedSec.toFixed(1), "s · rated ", conf === "got" ? "got it" : conf)), /*#__PURE__*/React.createElement("button", {
     className: "primary",
     onClick: onNext
   }, "NEXT →")));
@@ -1747,6 +1895,14 @@ function FormulaCard({
   const missing = blankIdx >= 0 ? tokens[blankIdx] : "";
   const [conf, setConf] = useState(null);
   const [submitted, setSubmitted] = useState(false);
+  const [now, setNow] = useState(Date.now());
+  const startRef = useRef(Date.now());
+  useEffect(() => {
+    if (submitted) return;
+    const t = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(t);
+  }, [submitted]);
+  const elapsedSec = (now - startRef.current) / 1000;
   const submit = () => {
     if (conf && !submitted) {
       setSubmitted(true);
@@ -1755,10 +1911,22 @@ function FormulaCard({
   };
   return /*#__PURE__*/React.createElement("div", {
     className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center"
+    }
   }, /*#__PURE__*/React.createElement(Stem, {
     item: item,
     label: phase === "blank" ? "COMPLETE THE FORMULA" : "RECALL THE WHOLE FORMULA"
-  }), /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: MONO,
+      fontSize: 12,
+      color: elapsedSec > SLOW_GOT_SEC ? C.shaky : C.faint
+    }
+  }, elapsedSec.toFixed(1), "s")), /*#__PURE__*/React.createElement("div", {
     className: "prompt",
     style: {
       fontSize: 16
@@ -2074,13 +2242,22 @@ function StatsMode({
       }
     }
     const avgSec = total ? totalSec / total : 0;
+    let due = 0,
+      leeches = 0;
+    for (const i of DATA.items) {
+      const p = progress[i.id];
+      if (i.t !== "a" && isDue(p)) due++; // due reviews (seen items only)
+      if (isLeech(p)) leeches++;
+    }
     return {
       seen,
       acc: total ? Math.round(right / total * 100) : 0,
       total,
       byDomain,
       avgSec,
-      slowGot
+      slowGot,
+      due,
+      leeches
     };
   }, [progress]);
 
@@ -2091,6 +2268,48 @@ function StatsMode({
       p: progress[i.id]
     })).filter(x => x.p && (x.p.slowGot || 0) > 0).sort((a, b) => b.p.slowGot - a.p.slowGot).slice(0, 20);
   }, [progress]);
+
+  // leeches: stubborn repeat-wrong items
+  const leechItems = useMemo(() => {
+    return DATA.items.map(i => ({
+      item: i,
+      p: progress[i.id]
+    })).filter(x => isLeech(x.p)).sort((a, b) => b.p.wrong - a.p.wrong).slice(0, 20);
+  }, [progress]);
+
+  // confused pairs: which wrong term you pick for a given item
+  const confusedPairs = useMemo(() => {
+    const byId = Object.fromEntries(DATA.items.map(i => [i.id, i]));
+    const pairs = [];
+    for (const i of DATA.items) {
+      const p = progress[i.id];
+      if (!p || !p.confused) continue;
+      for (const [wrongId, cnt] of Object.entries(p.confused)) {
+        if (cnt >= 2 && byId[wrongId]) pairs.push({
+          item: i,
+          wrong: byId[wrongId],
+          cnt
+        });
+      }
+    }
+    return pairs.sort((a, b) => b.cnt - a.cnt).slice(0, 15);
+  }, [progress]);
+
+  // daily activity
+  const daily = state.daily || {};
+  const todayCount = daily[todayStr()] || 0;
+  const dayStreak = useMemo(() => {
+    let s = 0;
+    const d = new Date();
+    for (;;) {
+      const key = d.toISOString().slice(0, 10);
+      if ((daily[key] || 0) > 0) {
+        s++;
+        d.setDate(d.getDate() - 1);
+      } else break;
+    }
+    return s;
+  }, [daily]);
   const reset = () => {
     if (confirm("Erase ALL progress, sessions, and streak everywhere (including cloud)? Cannot be undone.")) {
       replaceAll({
@@ -2099,7 +2318,8 @@ function StatsMode({
         streak: {
           best: 0,
           current: 0
-        }
+        },
+        daily: {}
       });
     }
   };
@@ -2137,6 +2357,35 @@ function StatsMode({
     label: "SESSIONS",
     value: sessions.length,
     sub: "recorded"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "statgrid",
+    style: {
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement(Stat, {
+    big: true,
+    label: "DUE TODAY",
+    value: stats.due,
+    sub: "scheduled for review",
+    color: stats.due > 0 ? C.amber : C.good
+  }), /*#__PURE__*/React.createElement(Stat, {
+    big: true,
+    label: "REVIEWED TODAY",
+    value: todayCount,
+    sub: "cards",
+    color: C.d2
+  }), /*#__PURE__*/React.createElement(Stat, {
+    big: true,
+    label: "DAY STREAK",
+    value: dayStreak,
+    sub: dayStreak === 1 ? "day" : "days",
+    color: C.amber
+  }), /*#__PURE__*/React.createElement(Stat, {
+    big: true,
+    label: "LEECHES",
+    value: stats.leeches,
+    sub: `wrong ≥${LEECH_WRONG}×`,
+    color: stats.leeches > 0 ? C.blank : C.good
   })), /*#__PURE__*/React.createElement("div", {
     className: "panelbox"
   }, /*#__PURE__*/React.createElement("div", {
@@ -2244,7 +2493,99 @@ function StatsMode({
     }
   }, "slow ", p.slowGot, "× · avg ", ((p.totalSec || 0) / (p.seen || 1)).toFixed(1), "s")))), /*#__PURE__*/React.createElement("div", {
     className: "hint"
-  }, "On a timed exam, a definition you know but recall slowly still costs you. Drill these to automaticity.")), /*#__PURE__*/React.createElement("div", {
+  }, "On a timed exam, a definition you know but recall slowly still costs you. Drill these to automaticity.")), leechItems.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "panelbox"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "paneltitle"
+  }, "🩸 LEECHES ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.faint,
+      fontWeight: 400
+    }
+  }, "· stubborn repeat-wrong items (≥", LEECH_WRONG, " wrong)")), leechItems.map(({
+    item,
+    p
+  }) => /*#__PURE__*/React.createElement("div", {
+    key: item.id,
+    className: "wrow"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(DomainTag, {
+    d: item.d,
+    small: true
+  }), item.ch && /*#__PURE__*/React.createElement("span", {
+    className: "chtag"
+  }, "CH", item.ch), item.t === "f" && /*#__PURE__*/React.createElement("span", {
+    className: "ftag"
+  }, "ƒ")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "sterm"
+  }, item.term), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: MONO,
+      fontSize: 10,
+      color: C.faint
+    }
+  }, "wrong ", p.wrong, "× of ", p.seen, " · ", Math.round(p.wrong / (p.seen || 1) * 100), "% miss")))), /*#__PURE__*/React.createElement("div", {
+    className: "hint"
+  }, "These keep tripping you up. Consider a mnemonic or writing them out by hand — a few stubborn items can quietly cost real points.")), confusedPairs.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "panelbox"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "paneltitle"
+  }, "🔀 CONFUSED PAIRS ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.faint,
+      fontWeight: 400
+    }
+  }, "· terms you mix up")), confusedPairs.map(({
+    item,
+    wrong,
+    cnt
+  }, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    className: "wrow"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.good,
+      fontWeight: 600
+    }
+  }, item.term), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.faint,
+      fontFamily: MONO,
+      margin: "0 8px"
+    }
+  }, "≠"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.blank,
+      fontWeight: 600
+    }
+  }, wrong.term)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: MONO,
+      fontSize: 10,
+      color: C.faint
+    }
+  }, "picked “", wrong.term, "” when it was “", item.term, "” · ", cnt, "×")))), /*#__PURE__*/React.createElement("div", {
+    className: "hint"
+  }, "You repeatedly pick the second when the answer is the first. Study them side by side to break the confusion.")), /*#__PURE__*/React.createElement("div", {
     className: "panelbox"
   }, /*#__PURE__*/React.createElement("div", {
     className: "paneltitle"
@@ -2580,6 +2921,8 @@ body { margin:0; }
 .seg { display:inline-flex; border:1px solid ${C.line}; border-radius:4px; overflow:hidden; }
 .segbtn { font-family:${MONO}; font-size:11px; padding:5px 10px; border:none; cursor:pointer; }
 .segbtn:not(:last-child){ border-right:1px solid ${C.line}; }
+.segglow { animation: dueglow 1.8s ease-in-out infinite; }
+@keyframes dueglow { 0%,100%{ box-shadow:0 0 0 0 ${C.amber}00; } 50%{ box-shadow:0 0 8px 1px ${C.amber}66; } }
 .chip { font-family:${MONO}; font-size:10.5px; letter-spacing:.5px; padding:6px 10px; background:transparent; border:1px solid ${C.line}; border-radius:4px; cursor:pointer; }
 .chip:hover { border-color:${C.dim}; }
 .sel { font-family:${MONO}; font-size:11px; background:${C.panel2}; color:${C.ink}; border:1px solid ${C.line}; border-radius:4px; padding:5px 8px; }
