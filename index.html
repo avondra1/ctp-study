@@ -1091,7 +1091,7 @@ function StudyMode({
     onClick: () => setHyOnly(v => !v),
     className: "chip",
     style: {
-      borderColor: hyOnly ? C.amber : C.line,
+      borderColor: hyOnly ? C.amber : C.faint,
       color: hyOnly ? C.amber : C.dim
     }
   }, "★ HIGH-YIELD"), /*#__PURE__*/React.createElement("button", {
@@ -1558,7 +1558,7 @@ function QuizSetup({
     onClick: () => setHyOnly(v => !v),
     className: "chip",
     style: {
-      borderColor: hyOnly ? C.amber : C.line,
+      borderColor: hyOnly ? C.amber : C.faint,
       color: hyOnly ? C.amber : C.dim
     }
   }, "★ HIGH-YIELD ONLY"), /*#__PURE__*/React.createElement("span", {
@@ -1981,7 +1981,7 @@ function BlankCard({
   }, correct ? "✓ Match" : "✗ No auto-match"), !auto && !submitted && /*#__PURE__*/React.createElement("button", {
     className: "chip",
     style: {
-      borderColor: override ? C.good : C.line,
+      borderColor: override ? C.good : C.faint,
       color: C.good,
       background: override ? C.good + "1a" : "transparent"
     },
@@ -2926,6 +2926,11 @@ function VerifyMode({
       }
     }, /*#__PURE__*/React.createElement("button", {
       className: "chip",
+      style: {
+        borderColor: C.amber,
+        color: C.amber,
+        fontWeight: 700
+      },
       onClick: () => setEditId(f.id)
     }, "✎ EDIT"), edit && /*#__PURE__*/React.createElement("button", {
       className: "chip",
@@ -3008,7 +3013,7 @@ function FormulaEditor({
   }, /*#__PURE__*/React.createElement("button", {
     className: "chip",
     style: {
-      borderColor: valid ? C.good : C.line,
+      borderColor: valid ? C.good : C.faint,
       color: valid ? C.good : C.faint,
       opacity: valid ? 1 : 0.5
     },
@@ -3177,7 +3182,7 @@ body { margin:0; }
 .segbtn:not(:last-child){ border-right:1px solid ${C.line}; }
 .segglow { animation: dueglow 1.8s ease-in-out infinite; }
 @keyframes dueglow { 0%,100%{ box-shadow:0 0 0 0 ${C.amber}00; } 50%{ box-shadow:0 0 8px 1px ${C.amber}66; } }
-.chip { font-family:${MONO}; font-size:10.5px; letter-spacing:.5px; padding:6px 10px; background:transparent; border:1px solid ${C.line}; border-radius:4px; cursor:pointer; }
+.chip { font-family:${MONO}; font-size:10.5px; letter-spacing:.5px; padding:6px 10px; background:transparent; border:1px solid ${C.faint}; color:${C.dim}; border-radius:4px; cursor:pointer; }
 .chip:hover { border-color:${C.dim}; }
 .sel { font-family:${MONO}; font-size:11px; background:${C.panel2}; color:${C.ink}; border:1px solid ${C.line}; border-radius:4px; padding:5px 8px; }
 .search { font-family:${MONO}; font-size:12px; background:${C.panel2}; color:${C.ink}; border:1px solid ${C.line}; border-radius:4px; padding:6px 10px; min-width:160px; margin-left:auto; }
