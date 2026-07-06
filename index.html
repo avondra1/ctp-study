@@ -344,6 +344,7 @@ const {
    ============================================================ */
 
 const DATA = window.__CTP_DATA__;
+const BUILD = "v2026.07.06-01";  // bump on every ship; visible in header
 
 // ---------- Supabase config (publishable key is browser-safe) ----------
 const SUPABASE_URL = "https://wsprzjjehvgogjtlpqnx.supabase.co";
@@ -1003,7 +1004,16 @@ function Header({
       color: C.faint,
       letterSpacing: "2px"
     }
-  }, "RETRIEVAL TERMINAL")), /*#__PURE__*/React.createElement("nav", {
+  }, "RETRIEVAL TERMINAL"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: MONO,
+      fontSize: 10,
+      color: C.dim,
+      letterSpacing: "1px",
+      marginLeft: 8
+    },
+    title: "build version — changes each update"
+  }, BUILD)), /*#__PURE__*/React.createElement("nav", {
     style: {
       display: "flex",
       gap: 4,
