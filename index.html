@@ -344,7 +344,7 @@ const {
    ============================================================ */
 
 const DATA = window.__CTP_DATA__;
-const BUILD = "v2026.07.06-03";  // bump on every ship; visible in header
+const BUILD = "v2026.07.06-04";  // bump on every ship; visible in header
 
 // ---------- Supabase config (publishable key is browser-safe) ----------
 const SUPABASE_URL = "https://wsprzjjehvgogjtlpqnx.supabase.co";
@@ -2068,11 +2068,6 @@ function QuizCard({
   onNext,
   progress
 }) {
-  if (item.t === "f") return /*#__PURE__*/React.createElement(FormulaCard, {
-    item: item,
-    onAnswer: onAnswer,
-    onNext: onNext
-  });
   return /*#__PURE__*/React.createElement(MCQCard, {
     item: item,
     onAnswer: onAnswer,
@@ -2224,9 +2219,11 @@ function MCQCard({
     onAnswer(correct, conf, item, correct ? null : selected);
   };
 
-  // prompt = the MEANING; options = the TERMS
-  const promptText = item.t === "a" ? item.body : maskGiveaway(stripCrossRef(resolvedBody(item)), item.term);
-  const label = item.t === "a" ? "NAME THE ACRONYM" : "NAME THE TERM";
+  // prompt = the MEANING (shown in full, no blanking); options = the TERMS.
+  // Formulas: show the equation and ask for its name (options are formula names).
+  const isFormula = item.t === "f";
+  const promptText = isFormula ? eqDisplay(resolvedFormula(item).eq) : item.t === "a" ? item.body : resolvedBody(item);
+  const label = isFormula ? "NAME THE FORMULA" : item.t === "a" ? "NAME THE ACRONYM" : "NAME THE TERM";
   return /*#__PURE__*/React.createElement("div", {
     className: "card"
   }, /*#__PURE__*/React.createElement(Stem, {
@@ -2235,9 +2232,10 @@ function MCQCard({
   }), /*#__PURE__*/React.createElement("div", {
     className: "prompt",
     style: {
-      fontSize: 17,
+      fontSize: isFormula ? 20 : 17,
       fontWeight: 500,
-      lineHeight: 1.5
+      lineHeight: 1.5,
+      fontFamily: isFormula ? MONO : SANS
     }
   }, promptText), /*#__PURE__*/React.createElement("div", {
     className: "opts"
@@ -2773,6 +2771,7 @@ function StatsMode({
         r: 0
       }
     };
+    const byChapter = {};
     for (const i of DATA.items) {
       const p = progress[i.id];
       if (!p) continue;
@@ -2783,6 +2782,14 @@ function StatsMode({
       if (i.d && byDomain[i.d]) {
         byDomain[i.d].s += p.seen || 0;
         byDomain[i.d].r += p.right || 0;
+      }
+      if (i.ch != null) {
+        if (!byChapter[i.ch]) byChapter[i.ch] = {
+          s: 0,
+          r: 0
+        };
+        byChapter[i.ch].s += p.seen || 0;
+        byChapter[i.ch].r += p.right || 0;
       }
     }
     const avgSec = total ? totalSec / total : 0;
@@ -2798,6 +2805,7 @@ function StatsMode({
       acc: total ? Math.round(right / total * 100) : 0,
       total,
       byDomain,
+      byChapter,
       avgSec,
       slowGot,
       due,
@@ -2979,7 +2987,51 @@ function StatsMode({
     }, b.s, " ans · ~", DOMAIN_WEIGHT[d], " Qs"));
   }), /*#__PURE__*/React.createElement("div", {
     className: "hint"
-  }, "Weights are OFFICIAL (2026–2028 Test Specifications). Chapter→domain routing is Claude's inference.")), recent.length > 0 && /*#__PURE__*/React.createElement("div", {
+  }, "Weights are OFFICIAL (2026–2028 Test Specifications). Chapter→domain map is OFFICIAL (ETM8 EEPP FAQ).")), /*#__PURE__*/React.createElement("div", {
+    className: "panelbox"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "paneltitle"
+  }, "ACCURACY BY CHAPTER"), Object.keys(stats.byChapter).map(Number).sort((a, b) => a - b).map(ch => {
+    const b = stats.byChapter[ch];
+    const acc = b.s ? Math.round(b.r / b.s * 100) : 0;
+    const dom = DATA.chapter_domain && DATA.chapter_domain[ch] && DATA.chapter_domain[ch].domain;
+    return /*#__PURE__*/React.createElement("div", {
+      key: ch,
+      className: "dombar"
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        width: 46,
+        fontFamily: MONO,
+        fontSize: 12,
+        color: dom ? DOMAIN_COLOR[dom] : C.faint,
+        fontWeight: 700
+      }
+    }, "CH", ch), /*#__PURE__*/React.createElement("div", {
+      className: "dbartrack"
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        width: `${acc}%`,
+        background: dom ? DOMAIN_COLOR[dom] : C.dim
+      }
+    })), /*#__PURE__*/React.createElement("span", {
+      style: {
+        width: 42,
+        textAlign: "right",
+        fontFamily: MONO,
+        fontSize: 12,
+        color: b.s ? C.ink : C.faint
+      }
+    }, b.s ? acc + "%" : "—"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        width: 120,
+        fontSize: 10,
+        color: C.faint,
+        fontFamily: MONO
+      }
+    }, b.s, " ans", dom ? " · D" + dom : ""));
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "hint"
+  }, "Chapters you haven't answered yet won't appear until you quiz them.")), recent.length > 0 && /*#__PURE__*/React.createElement("div", {
     className: "panelbox"
   }, /*#__PURE__*/React.createElement("div", {
     className: "paneltitle"
