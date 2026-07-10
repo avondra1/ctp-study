@@ -344,7 +344,7 @@ const {
    ============================================================ */
 
 const DATA = window.__CTP_DATA__;
-const BUILD = "v2026.07.06-06";  // bump on every ship; visible in header
+const BUILD = "v2026.07.06-07";  // bump on every ship; visible in header
 
 // ---------- Supabase config (publishable key is browser-safe) ----------
 const SUPABASE_URL = "https://wsprzjjehvgogjtlpqnx.supabase.co";
@@ -617,7 +617,8 @@ function App() {
       current: 0
     },
     daily: {},
-    formulaEdits: {}
+    formulaEdits: {},
+    flags: {}
   });
   const [loaded, setLoaded] = useState(false);
   const [sync, setSync] = useState({
@@ -808,6 +809,25 @@ function App() {
       };
     });
   }, [persistFn]);
+  const toggleFlag = useCallback((id, note) => {
+    persistFn(prev => {
+      const flags = {
+        ...(prev.flags || {})
+      };
+      if (flags[id]) {
+        delete flags[id];
+      } else {
+        flags[id] = {
+          at: todayStr(),
+          note: note || ""
+        };
+      }
+      return {
+        ...prev,
+        flags: flags
+      };
+    });
+  }, [persistFn]);
   const resetStudyLog = useCallback((ids) => {
     persistFn(prev => {
       if (!ids) return {
@@ -916,10 +936,14 @@ function App() {
     sessions: state.sessions,
     saveSessions: saveSessions,
     streak: state.streak,
-    saveStreak: saveStreak
+    saveStreak: saveStreak,
+    flags: state.flags || {},
+    toggleFlag: toggleFlag
   }), tab === "weak" && /*#__PURE__*/React.createElement(WeakMode, {
     progress: state.progress,
-    setTab: setTab
+    setTab: setTab,
+    flags: state.flags || {},
+    toggleFlag: toggleFlag
   }), tab === "stats" && /*#__PURE__*/React.createElement(StatsMode, {
     state: state,
     replaceAll: replaceAll,
@@ -960,12 +984,27 @@ function mergeState(a, b) {
     ...(b.formulaEdits || {}),
     ...(a.formulaEdits || {})
   };
+  // flags: union, local (a) wins on conflict — so a flag set on this device persists
+  const flags = {
+    ...(b.flags || {}),
+    ...(a.flags || {})
+  };
+  // studyLog: per-item keep the higher count
+  const studyLog = {
+    ...(a.studyLog || {})
+  };
+  for (const [id, r] of Object.entries(b.studyLog || {})) {
+    const cur = studyLog[id];
+    if (!cur || (r.count || 0) > (cur.count || 0)) studyLog[id] = r;
+  }
   return {
     progress,
     sessions: sessions.slice(0, 200),
     streak,
     daily,
-    formulaEdits
+    formulaEdits,
+    flags,
+    studyLog
   };
 }
 function Splash() {
@@ -1533,11 +1572,40 @@ function buildQueue(progress, opts) {
   // mastery filter
   if (mastery === "unmastered") pool = pool.filter(i => !isMastered(progress[i.id]));else if (mastery === "mastered") pool = pool.filter(i => isMastered(progress[i.id]));
   const locked = flat || domainFilter !== "all" || chapterFilter && chapterFilter !== "all";
+  const today = todayStr();
+  // Live per-domain accuracy from ACTUAL progress (not hardcoded). The lowest-accuracy
+  // domain gets the biggest boost, so priority follows real weakness and self-corrects
+  // as you improve — no domain is permanently favored.
+  const domAcc = {};
+  for (const it of DATA.items) {
+    const pp = progress[it.id];
+    if (!pp || !pp.seen || it.d == null) continue;
+    if (!domAcc[it.d]) domAcc[it.d] = {
+      s: 0,
+      r: 0
+    };
+    domAcc[it.d].s += pp.seen;
+    domAcc[it.d].r += pp.right || 0;
+  }
+  const domWeakBoost = {};
+  for (const d in domAcc) {
+    const acc = domAcc[d].s ? domAcc[d].r / domAcc[d].s : 1;
+    // 100% acc → 1.0 (no boost); 50% acc → ~1.5; scales inversely with accuracy
+    domWeakBoost[d] = 1 + (1 - acc);
+  }
   const scored = pool.map(i => {
     const dw = locked ? 10 : DOMAIN_WEIGHT[i.d] || 10;
+    const p = progress[i.id];
+    // Formulas are high-value and few — surface them regularly.
+    const formulaBoost = i.t === "f" ? 1.6 : 1;
+    // Live weakness: domains you're currently worst at get boosted (data-driven).
+    const weakBoost = domWeakBoost[i.d] || 1;
+    // Anti-repeat: something already answered today drops back so a second
+    // session of the day pulls DIFFERENT items rather than the same set.
+    const seenTodayPenalty = p && p.lastSeen === today ? 0.25 : 1;
     return {
       item: i,
-      w: dw * errorWeight(progress[i.id]) * (0.6 + Math.random() * 0.8)
+      w: dw * formulaBoost * weakBoost * seenTodayPenalty * errorWeight(p) * (0.6 + Math.random() * 0.8)
     };
   });
   scored.sort((a, b) => b.w - a.w);
@@ -1625,7 +1693,9 @@ function QuizMode({
   sessions,
   saveSessions,
   streak,
-  saveStreak
+  saveStreak,
+  flags,
+  toggleFlag
 }) {
   const [config, setConfig] = useState(null); // null = setup screen
   const [queue, setQueue] = useState([]);
@@ -1788,7 +1858,9 @@ function QuizMode({
     item: item,
     onAnswer: onAnswer,
     onNext: next,
-    progress: progress
+    progress: progress,
+    flags: flags,
+    toggleFlag: toggleFlag
   })), paused && /*#__PURE__*/React.createElement("div", {
     onClick: togglePause,
     style: {
@@ -1836,13 +1908,15 @@ function QuizSetup({
   const dueOnly = scope === "due";
 
   // global count of due items (defs+formulas) — drives the Due button glow
-  const dueCount = useMemo(() => countAvailable(progress, {
+  // items you've already seen that are scheduled for review today, capped at the daily
+  // review load so the number is an actionable session size, not a demoralizing backlog
+  const dueCount = useMemo(() => Math.min(120, countAvailable(progress, {
     domainFilter: "all",
     chapterFilter: "all",
     typeFilter: "all",
     hyOnly: false,
     dueOnly: true
-  }), [progress]);
+  })), [progress]);
   const available = useMemo(() => countAvailable(progress, {
     domainFilter,
     chapterFilter,
@@ -1852,7 +1926,11 @@ function QuizSetup({
     dueOnly
   }), [progress, domainFilter, chapterFilter, type, hyOnly, mastery, dueOnly]);
   const chapDomain = DATA.chapter_domain[chapter]?.domain;
-  const wantN = n === "all" ? available : Number(n);
+  // Sustainable daily review cap. The DUE queue is priority-ordered (leeches, overdue,
+  // formulas, live weakest-domain), so the cap surfaces the 120 that matter most rather
+  // than an unsustainable 500. Only applies to the Due scope; explicit scopes are honored.
+  const DUE_CAP = 120;
+  const wantN = n === "all" ? dueOnly ? Math.min(available, DUE_CAP) : available : Number(n);
   const sessionN = Math.min(wantN, available);
   return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2066,12 +2144,16 @@ function QuizCard({
   item,
   onAnswer,
   onNext,
-  progress
+  progress,
+  flags,
+  toggleFlag
 }) {
   return /*#__PURE__*/React.createElement(MCQCard, {
     item: item,
     onAnswer: onAnswer,
-    onNext: onNext
+    onNext: onNext,
+    flags: flags,
+    toggleFlag: toggleFlag
   });
 }
 function Stem({
@@ -2187,7 +2269,9 @@ function ConfPick({
 function MCQCard({
   item,
   onAnswer,
-  onNext
+  onNext,
+  flags,
+  toggleFlag
 }) {
   const pool = useMemo(() => DATA.items.filter(i => i.t === item.t), [item]);
   const {
@@ -2222,8 +2306,29 @@ function MCQCard({
   // prompt = the MEANING (shown in full, no blanking); options = the TERMS.
   // Formulas: show the equation and ask for its name (options are formula names).
   const isFormula = item.t === "f";
-  const promptText = isFormula ? eqDisplay(resolvedFormula(item).eq) : item.t === "a" ? item.body : resolvedBody(item);
+  const rf = isFormula ? resolvedFormula(item) : null;
+  const promptText = isFormula ? eqDisplay(rf.eq) : item.t === "a" ? item.body : resolvedBody(item);
   const label = isFormula ? "NAME THE FORMULA" : item.t === "a" ? "NAME THE ACRONYM" : "NAME THE TERM";
+  const legendBlock = isFormula && rf.leg && rf.leg.length ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      paddingTop: 10,
+      borderTop: `1px solid ${C.line}`,
+      fontFamily: MONO,
+      fontSize: 12,
+      color: C.dim,
+      lineHeight: 1.6
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.faint,
+      fontSize: 10,
+      letterSpacing: "1px",
+      marginBottom: 3
+    }
+  }, "WHERE:"), rf.leg.map((l, ix) => /*#__PURE__*/React.createElement("div", {
+    key: ix
+  }, l))) : null;
   return /*#__PURE__*/React.createElement("div", {
     className: "card"
   }, /*#__PURE__*/React.createElement(Stem, {
@@ -2237,7 +2342,7 @@ function MCQCard({
       lineHeight: 1.5,
       fontFamily: isFormula ? MONO : SANS
     }
-  }, promptText), /*#__PURE__*/React.createElement("div", {
+  }, promptText), legendBlock, /*#__PURE__*/React.createElement("div", {
     className: "opts"
   }, options.map(o => {
     let cls = "opt";
@@ -2295,7 +2400,23 @@ function MCQCard({
       color: C.faint,
       marginLeft: 10
     }
-  }, "· ", elapsedSec.toFixed(1), "s · rated ", conf === "got" ? "got it" : conf)), /*#__PURE__*/React.createElement("button", {
+  }, "· ", elapsedSec.toFixed(1), "s · rated ", conf === "got" ? "got it" : conf)), flags && toggleFlag && /*#__PURE__*/React.createElement("button", {
+    onClick: () => toggleFlag(item.id),
+    style: {
+      display: "block",
+      marginTop: 10,
+      marginBottom: 4,
+      padding: "6px 12px",
+      background: "transparent",
+      border: `1px solid ${flags[item.id] ? C.amber : C.line}`,
+      borderRadius: 6,
+      color: flags[item.id] ? C.amber : C.faint,
+      fontFamily: MONO,
+      fontSize: 11,
+      letterSpacing: "0.5px",
+      cursor: "pointer"
+    }
+  }, flags[item.id] ? "⚑ FLAGGED — NEEDS ATTENTION (TAP TO UNFLAG)" : "⚐ FLAG THIS QUESTION"), /*#__PURE__*/React.createElement("button", {
     className: "primary",
     onClick: onNext
   }, "NEXT →")));
@@ -2646,7 +2767,9 @@ function DoneStat({
 // =================== WEAK ITEMS ===================
 function WeakMode({
   progress,
-  setTab
+  setTab,
+  flags,
+  toggleFlag
 }) {
   const ranked = useMemo(() => {
     const seen = DATA.items.filter(i => progress[i.id] && (progress[i.id].seen || 0) > 0);
@@ -2673,7 +2796,55 @@ function WeakMode({
     n: "03",
     label: "WEAK ITEMS",
     sub: "Your worst-performing items, weighted so Domain 1 gaps rise to the top. This is your hit list."
-  }), ranked.length === 0 ? /*#__PURE__*/React.createElement(Empty, {
+  }), flags && Object.keys(flags).length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 22
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: MONO,
+      fontSize: 12,
+      color: C.amber,
+      letterSpacing: "1px",
+      marginBottom: 8
+    }
+  }, "⚑ FLAGGED FOR ATTENTION (", Object.keys(flags).length, ")"), Object.keys(flags).map(fid => {
+    const fitem = DATA.items.find(x => x.id === fid);
+    if (!fitem) return null;
+    return /*#__PURE__*/React.createElement("div", {
+      key: fid,
+      className: "wrow",
+      style: {
+        borderLeft: `2px solid ${C.amber}`
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        flex: 1
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 600
+      }
+    }, fitem.term), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: C.faint,
+        fontFamily: MONO
+      }
+    }, fitem.t === "f" ? "formula" : fitem.t === "a" ? "acronym" : "term", fitem.ch ? " · CH" + fitem.ch : "", fitem.d ? " · D" + fitem.d : "")), /*#__PURE__*/React.createElement("button", {
+      onClick: () => toggleFlag(fid),
+      style: {
+        background: "transparent",
+        border: `1px solid ${C.line}`,
+        borderRadius: 6,
+        color: C.faint,
+        fontFamily: MONO,
+        fontSize: 10,
+        padding: "4px 10px",
+        cursor: "pointer"
+      }
+    }, "CLEAR"));
+  })), ranked.length === 0 ? /*#__PURE__*/React.createElement(Empty, {
     msg: "No weak items yet — run a quiz session and your misses will collect here."
   }) : /*#__PURE__*/React.createElement("div", {
     className: "weaklist"
